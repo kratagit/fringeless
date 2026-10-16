@@ -17,7 +17,10 @@ fraction of a pixel so the channels line up with the physical subpixels again.
   Catmull-Rom), then applies a small Laplacian that restores the contrast the
   interpolation would otherwise soften.
 - The result is shown in a click-through, always-on-top window that covers the
-  display and is excluded from screen capture, so the capture never sees it.
+  display and is excluded from screen capture, so the capture never sees it. The
+  window has its own thread that only handles window messages, so it stays responsive
+  while rendering waits on the GPU; if rendering stalls for more than 1.5 s, the overlay
+  is hidden until it recovers, so a frozen image never covers the screen.
 - Correction pauses automatically while a fullscreen game or video player is in
   front; browsers, editors and terminals in full screen keep it.
 
@@ -64,6 +67,7 @@ The gear button opens **Settings**:
   block typing.
 - **Startup**: start with Windows, in the tray.
 - **Settings file**: where settings are stored, `%APPDATA%\Fringeless\settings.ini`.
+  Slow or stalled rendering steps are recorded in `diagnostics.log` in the same folder.
 
 Closing the window keeps Fringeless running in the tray; click the tray icon to bring
 it back, right-click for the menu.

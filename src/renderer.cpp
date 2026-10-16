@@ -14,8 +14,10 @@
 #include <shellapi.h>
 
 #include <algorithm>
+#include <cstdarg>
 #include <cwchar>
 #include <cwctype>
+#include <mutex>
 
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
@@ -29,6 +31,189 @@ typedef HRESULT(WINAPI* D3DCompileFn)(LPCVOID, SIZE_T, LPCSTR, const void*, void
 // Input texels an output pixel reads beyond its own position: up to 1 px of integer
 // shift plus the 4-tap kernel and the Laplacian reach 3 texels; 1 more for safety.
 static const int kReadMargin = 4;
+
+// ---------------------------------------------------------------------------
+// Diagnostics: %APPDATA%\Fringeless\diagnostics.log records anything slow
+// ---------------------------------------------------------------------------
+
+static std::mutex g_logLock;
+
+static void Log(const wchar_t* fmt, ...) {
+    wchar_t line[512];
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    int n = swprintf(line, 512, L"%04u-%02u-%02u %02u:%02u:%02u.%03u  ", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute,
+                     t.wSecond, t.wMilliseconds);
+    va_list args;
+    va_start(args, fmt);
+    vswprintf(line + n, 512 - n, fmt, args);
+    va_end(args);
+    wcscat(line, L"\r\n");
+
+    std::lock_guard<std::mutex> lock(g_logLock);
+    std::wstring path = SettingsFolder() + L"\\diagnostics.log";
+    WIN32_FILE_ATTRIBUTE_DATA info;
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &info) && info.nFileSizeLow > 512 * 1024)
+        DeleteFileW(path.c_str());   // keep it small: start over
+    HANDLE f = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    char utf8[1024];
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, line, -1, utf8, sizeof(utf8), nullptr, nullptr);
+    DWORD written;
+    if (bytes > 1) WriteFile(f, utf8, bytes - 1, &written, nullptr);
+    CloseHandle(f);
+}
+
+// What the render thread is doing right now, for the stall reports.
+static std::atomic<const wchar_t*> g_step{ L"starting" };
+
+// Marks a step that should be quick and logs it when it is not.
+struct TimedStep {
+    const wchar_t* name;
+    ULONGLONG start;
+    explicit TimedStep(const wchar_t* n) : name(n), start(GetTickCount64()) { g_step = n; }
+    ~TimedStep() {
+        ULONGLONG ms = GetTickCount64() - start;
+        if (ms >= 1000) Log(L"%ls took %llu ms", name, ms);
+        g_step = L"idle";
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Overlay window host
+// ---------------------------------------------------------------------------
+//
+// The overlay window lives on its own thread that does nothing but process window
+// messages. The render thread waits on the GPU and on Desktop Duplication; if it owned
+// the window, any long wait would make Windows treat the full-screen overlay as not
+// responding and cover the screen with a frozen "ghost" of it. The render thread only
+// talks to the window asynchronously, and a watchdog here hides the overlay as soon as
+// rendering stalls, so a stale image never stays on screen.
+
+static const UINT WM_OVERLAY_CREATE = WM_APP + 1;    // thread message, lParam: CreateRequest*
+static const UINT WM_OVERLAY_DESTROY = WM_APP + 2;   // window message
+static const ULONGLONG kStallMs = 1500;
+
+struct CreateRequest {
+    RECT rect;
+    HWND hwnd = nullptr;
+    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ~CreateRequest() { CloseHandle(done); }
+};
+
+static DWORD g_hostThreadId;
+static HANDLE g_hostThread;
+static std::atomic<HWND> g_overlayWindow{ nullptr };
+static std::atomic<ULONGLONG> g_heartbeat{ 0 };      // last time the render thread made progress
+static std::atomic<bool> g_hiddenByWatchdog{ false };
+
+static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_OVERLAY_DESTROY) {
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    if (msg == WM_DESTROY && g_overlayWindow == hwnd) g_overlayWindow = nullptr;
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void Watchdog() {
+    HWND hwnd = g_overlayWindow;
+    if (!hwnd || !IsWindowVisible(hwnd)) return;
+    ULONGLONG stalled = GetTickCount64() - g_heartbeat;
+    if (stalled < kStallMs) return;
+    ShowWindow(hwnd, SW_HIDE);
+    g_hiddenByWatchdog = true;
+    Log(L"rendering stalled for %llu ms in: %ls; overlay hidden", stalled, (const wchar_t*)g_step);
+}
+
+static void NameThread(const wchar_t* name) {
+    typedef HRESULT(WINAPI * SetThreadDescriptionFn)(HANDLE, PCWSTR);
+    if (auto set = (SetThreadDescriptionFn)(void*)GetProcAddress(GetModuleHandleW(L"kernel32"), "SetThreadDescription"))
+        set(GetCurrentThread(), name);
+}
+
+static DWORD WINAPI OverlayHostThread(void* ready) {
+    NameThread(L"Fringeless overlay");
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = OverlayProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"FringelessOverlay";
+    RegisterClassW(&wc);
+
+    MSG msg;
+    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);   // create the message queue
+    SetEvent((HANDLE)ready);
+    SetTimer(nullptr, 0, 250, nullptr);
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (!msg.hwnd && msg.message == WM_OVERLAY_CREATE) {
+            auto* req = (CreateRequest*)msg.lParam;
+            const RECT& r = req->rect;
+            // Click-through, never activated, excluded from capture so the duplication
+            // never sees the overlay itself.
+            HWND hwnd = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW |
+                                            WS_EX_TOPMOST,
+                                        L"FringelessOverlay", APP_NAME, WS_POPUP, r.left, r.top, r.right - r.left,
+                                        r.bottom - r.top, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+            if (hwnd) {
+                SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+                if (!SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)) {
+                    DestroyWindow(hwnd);
+                    hwnd = nullptr;
+                }
+            }
+            g_overlayWindow = hwnd;
+            req->hwnd = hwnd;
+            SetEvent(req->done);
+            continue;
+        }
+        if (!msg.hwnd && msg.message == WM_TIMER) {
+            Watchdog();
+            continue;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return 0;
+}
+
+static void StartOverlayHost() {
+    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_hostThread = CreateThread(nullptr, 0, OverlayHostThread, ready, 0, &g_hostThreadId);
+    WaitForSingleObject(ready, 5000);
+    CloseHandle(ready);
+}
+
+static void StopOverlayHost() {
+    if (!g_hostThread) return;
+    PostThreadMessageW(g_hostThreadId, WM_QUIT, 0, 0);
+    WaitForSingleObject(g_hostThread, 2000);
+    CloseHandle(g_hostThread);
+    g_hostThread = nullptr;
+}
+
+static HWND CreateOverlay(const RECT& rect) {
+    auto* req = new CreateRequest;
+    req->rect = rect;
+    if (!PostThreadMessageW(g_hostThreadId, WM_OVERLAY_CREATE, 0, (LPARAM)req)) {
+        delete req;
+        return nullptr;
+    }
+    if (WaitForSingleObject(req->done, 5000) != WAIT_OBJECT_0) return nullptr;   // host still owns req
+    HWND hwnd = req->hwnd;
+    delete req;
+    return hwnd;
+}
+
+// Asynchronous window operations: never wait on the host thread.
+static void ShowOverlay(HWND hwnd, bool show) {
+    if (hwnd) ShowWindowAsync(hwnd, show ? SW_SHOWNA : SW_HIDE);
+}
+
+static void RaiseOverlay(HWND hwnd) {
+    if (hwnd)
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOSIZE | SWP_NOMOVE | SWP_NOREDRAW | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+}
 
 // Output area that still has to be redrawn from the current desktop copy.
 struct RedrawRegion {
@@ -96,7 +281,7 @@ struct Gpu {
         SafeRelease(ctx);
         SafeRelease(dev);
         if (overlay) {
-            DestroyWindow(overlay);
+            PostMessageW(overlay, WM_OVERLAY_DESTROY, 0, 0);   // destroyed by its own thread
             overlay = nullptr;
         }
     }
@@ -158,12 +343,8 @@ static bool SetupTarget(Gpu& g, std::wstring& device, RECT& mon, int& w, int& h)
     w = mon.right - mon.left;
     h = mon.bottom - mon.top;
 
-    g.overlay = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-                                L"FringelessOverlay", APP_NAME, WS_POPUP, mon.left, mon.top, w, h, nullptr, nullptr,
-                                GetModuleHandleW(nullptr), nullptr);
+    g.overlay = CreateOverlay(mon);
     if (!g.overlay) return false;
-    SetLayeredWindowAttributes(g.overlay, 0, 255, LWA_ALPHA);
-    if (!SetWindowDisplayAffinity(g.overlay, WDA_EXCLUDEFROMCAPTURE)) return false;
 
     device = d.device;
     IDXGIAdapter1* adapter = nullptr;
@@ -273,12 +454,8 @@ static bool ForegroundIsFullscreen(HWND overlay, const RECT& mon) {
 }
 
 DWORD WINAPI RenderThread(void*) {
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc = DefWindowProcW;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"FringelessOverlay";
-    RegisterClassW(&wc);
-
+    NameThread(L"Fringeless render");
+    StartOverlayHost();
     Gpu g;
     LARGE_INTEGER freq{}, lastRender{}, lastFrame{};
     QueryPerformanceFrequency(&freq);
@@ -307,8 +484,8 @@ DWORD WINAPI RenderThread(void*) {
     std::vector<BYTE> meta;
 
     auto ShowOverlayTopmost = [&] {
-        ShowWindow(g.overlay, SW_SHOWNA);
-        SetWindowPos(g.overlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOREDRAW | SWP_NOACTIVATE);
+        ShowOverlay(g.overlay, true);
+        RaiseOverlay(g.overlay);
         g_runtime.redrawAll = true;
     };
 
@@ -351,10 +528,13 @@ DWORD WINAPI RenderThread(void*) {
         for (size_t i = 0; i < rects.size(); ++i) {
             UINT64 differing = 1;   // no query result: assume it changed
             if (i < g.queries.size()) {
+                // Normally ready within a frame; give up after 250 ms and assume a change.
                 HRESULT qr;
-                while ((qr = g.ctx->GetData(g.queries[i], &differing, sizeof(differing), 0)) == S_FALSE)
+                ULONGLONG start = GetTickCount64();
+                while ((qr = g.ctx->GetData(g.queries[i], &differing, sizeof(differing), 0)) == S_FALSE &&
+                       GetTickCount64() - start < 250)
                     SwitchToThread();
-                if (FAILED(qr)) differing = 1;
+                if (qr != S_OK) differing = 1;
             }
             if (differing) {
                 pending.AddChanged(rects[i], W, H);
@@ -407,15 +587,19 @@ DWORD WINAPI RenderThread(void*) {
         ULONGLONG now = GetTickCount64();
         if (now - lastTopmost > 1999) {
             // Other topmost windows can end up above us; re-assert every 2 s.
-            if (!IsWindowVisible(g.overlay)) ShowWindow(g.overlay, SW_SHOWNA);
-            SetWindowPos(g.overlay, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOREDRAW | SWP_NOACTIVATE);
+            if (!IsWindowVisible(g.overlay)) ShowOverlay(g.overlay, true);
+            RaiseOverlay(g.overlay);
             g_runtime.redrawAll = true;
             lastTopmost = now;
         }
 
         DXGI_OUTDUPL_FRAME_INFO fi = {};
         IDXGIResource* res = nullptr;
-        HRESULT hr = g.dup->AcquireNextFrame(32, &fi, &res);
+        HRESULT hr;
+        {
+            TimedStep step(L"AcquireNextFrame");
+            hr = g.dup->AcquireNextFrame(32, &fi, &res);
+        }
         bool changed = false;
         int throttleMs = 0;
 
@@ -530,6 +714,7 @@ DWORD WINAPI RenderThread(void*) {
                         }
                     }
                     if (rects.empty()) rects.push_back({ 0, 0, (LONG)td.Width, (LONG)td.Height });
+                    TimedStep step(L"change detection");
                     changed = TakeChangedRects(tex, rects, td.Width, td.Height);
                     // Small updates (caret blink, typing) are rate-limited to ~30 fps.
                     INT64 full = (INT64)W * H;
@@ -559,7 +744,10 @@ DWORD WINAPI RenderThread(void*) {
             }
         }
 
-        hr = Draw();
+        {
+            TimedStep step(L"draw and present");
+            hr = Draw();
+        }
         if (hr == DXGI_STATUS_OCCLUDED) {
             Sleep(60);
             lastTopmost = 0;
@@ -580,7 +768,8 @@ DWORD WINAPI RenderThread(void*) {
     auto Step = [&](bool needShow) {
         if (msPerTick > 0.0 && ElapsedMs(lastFrame) > 1500.0) {
             // AcquireNextFrame has not returned for 1.5 s: the duplication is wedged.
-            if (!needShow) ShowWindow(g.overlay, SW_HIDE);
+            if (!needShow) ShowOverlay(g.overlay, false);
+            Log(L"no frame from Desktop Duplication for 1.5 s; restarting capture");
             g.ReleaseFrameResources();
             SafeRelease(g.dup);
             QueryPerformanceCounter(&lastFrame);
@@ -598,7 +787,10 @@ DWORD WINAPI RenderThread(void*) {
         ULONGLONG now = GetTickCount64();
         if (now - lastDupAttempt >= 500) {
             long before = g_runtime.captureHr;
-            g_runtime.captureHr = Duplicate(g, device);
+            {
+                TimedStep step(L"DuplicateOutput");
+                g_runtime.captureHr = Duplicate(g, device);
+            }
             if ((before < 0) != (g_runtime.captureHr < 0)) NotifyPanel();
             lastDupAttempt = now;
             if (!g.dup) ++dupFailures;
@@ -620,16 +812,23 @@ DWORD WINAPI RenderThread(void*) {
     };
 
     while (g_runtime.running) {
-        MSG msg;
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        // Progress for the watchdog. After it hid a stalled overlay, show it again
+        // (fully redrawn) now that rendering runs.
+        ULONGLONG beat = GetTickCount64();
+        if (g_heartbeat && beat - g_heartbeat >= kStallMs)
+            Log(L"rendering resumed after %llu ms", beat - (ULONGLONG)g_heartbeat);
+        g_heartbeat = beat;
+        if (g_hiddenByWatchdog.exchange(false)) hiddenNoCapture = true;
 
         if (g_runtime.retarget != lastRetarget) {
             g.ReleaseAll();
             lastRetarget = g_runtime.retarget;
-            if (!SetupTarget(g, device, mon, W, H)) {
+            bool ok;
+            {
+                TimedStep step(L"display setup");
+                ok = SetupTarget(g, device, mon, W, H);
+            }
+            if (!ok) {
                 g.ReleaseAll();
                 Sleep(300);
                 continue;
@@ -644,7 +843,7 @@ DWORD WINAPI RenderThread(void*) {
 
         int enabled = g_settings.enabled ? 1 : 0;
         if (enabled != lastEnabled) {
-            ShowWindow(g.overlay, enabled ? SW_SHOWNA : SW_HIDE);
+            ShowOverlay(g.overlay, enabled != 0);
             g_runtime.redrawAll = true;
             hiddenNoCapture = false;
         }
@@ -658,12 +857,13 @@ DWORD WINAPI RenderThread(void*) {
         bool wantPause = paused;
         if (now - lastFsCheck >= 400) {
             lastFsCheck = now;
+            TimedStep step(L"fullscreen check");
             wantPause = ForegroundIsFullscreen(g.overlay, mon) && g_settings.pauseInFullscreen;
         }
 
         if (g_settings.pauseInFullscreen && wantPause) {
             if (!paused) {
-                ShowWindow(g.overlay, SW_HIDE);
+                ShowOverlay(g.overlay, false);
                 g_runtime.paused = true;
                 g.ReleaseFrameResources();
                 SafeRelease(g.dup);
@@ -685,7 +885,7 @@ DWORD WINAPI RenderThread(void*) {
         }
 
         if (!g.dup) {
-            if (!hiddenNoCapture) ShowWindow(g.overlay, SW_HIDE);
+            if (!hiddenNoCapture) ShowOverlay(g.overlay, false);
             RecreateDuplication();
             continue;
         }
@@ -693,5 +893,6 @@ DWORD WINAPI RenderThread(void*) {
     }
 
     g.ReleaseAll();
+    StopOverlayHost();
     return 0;
 }
