@@ -1,0 +1,51 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 (UCRT)
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Add MinGW to PATH
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin"
+
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Build tests
+        shell: pwsh
+        run: g++ -std=c++17 -O2 -Wall -static -o build/verify.exe tests/verify.cpp -ld3d11 -lgdi32 -luuid
+
+      - name: Upload Fringeless.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fringeless
+          path: build/Fringeless.exe
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" build/Fringeless.exe --title "Fringeless ${{ github.ref_name }}" --generate-notes
