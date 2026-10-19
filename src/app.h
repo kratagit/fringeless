@@ -99,7 +99,12 @@ std::wstring ProcessNameOf(HWND hwnd);
 // Modules
 // ---------------------------------------------------------------------------
 
-DWORD WINAPI RenderThread(void*);
+// DWM correction engine (src/dwm_engine.cpp). The correction runs inside dwm.exe; the app
+// injects the engine (one UAC prompt) when correction is first enabled and drives it live.
+void DwmEngineSync();       // after a settings change / at startup: inject on off->on, push params
+void DwmEngineShutdown();   // release handles on exit; leaves the engine loaded in dwm
+void DwmEngineStop();       // fully unload the engine from dwm (one UAC prompt)
+bool DwmEngineReady();      // true once the engine's parameter block is mapped
 
 enum : UINT {
     WM_APP_TRAY = WM_APP + 1,      // tray icon callback

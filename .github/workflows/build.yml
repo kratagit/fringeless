@@ -32,15 +32,14 @@ jobs:
         shell: pwsh
         run: ./build.ps1
 
-      - name: Build tests
-        shell: pwsh
-        run: g++ -std=c++17 -O2 -Wall -static -o build/verify.exe tests/verify.cpp -ld3d11 -lgdi32 -luuid
-
-      - name: Upload Fringeless.exe
+      - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
           name: Fringeless
-          path: build/Fringeless.exe
+          path: |
+            build/Fringeless.exe
+            build/fringeless_dwm.dll
+            build/fringeless_inject.exe
           if-no-files-found: error
 
       - name: Publish release
@@ -48,4 +47,4 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${{ github.ref_name }}" build/Fringeless.exe --title "Fringeless ${{ github.ref_name }}" --generate-notes
+        run: gh release create "${{ github.ref_name }}" build/Fringeless.exe build/fringeless_dwm.dll build/fringeless_inject.exe --title "Fringeless ${{ github.ref_name }}" --generate-notes
