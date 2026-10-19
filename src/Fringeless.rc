@@ -3,7 +3,6 @@
 #include "resource.h"
 
 IDI_APP     ICON    "Fringeless.ico"
-IDR_SHADER  RCDATA  "shader.hlsl"
 
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "Fringeless.manifest"
 

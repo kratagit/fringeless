@@ -33,4 +33,33 @@ $libs = @('-ld3d11', '-ldxgi', '-ld2d1', '-ldwrite', '-ldwmapi', '-lcomctl32', '
 if ($LASTEXITCODE) { throw 'g++ failed' }
 
 & "$bin\strip.exe" build\Fringeless.exe
-Get-Item build\Fringeless.exe | Select-Object FullName, Length
+
+# --- DWM correction engine: fringeless_dwm.dll + fringeless_inject.exe --------------
+# Derived from dwm_lut (GPL-3.0); see src/dwm and LICENSE. Built separately from the app
+# (the app loads neither; the injector places the DLL into dwm.exe at runtime).
+$mh = 'third_party\minhook'
+$mhObjs = @()
+foreach ($c in @("$mh\src\buffer.c", "$mh\src\hook.c", "$mh\src\trampoline.c",
+                 "$mh\src\hde\hde32.c", "$mh\src\hde\hde64.c")) {
+    $o = 'build\mh_' + [IO.Path]::GetFileNameWithoutExtension($c) + '.o'
+    & "$bin\gcc.exe" -O2 -c "-I$mh\include" -o $o $c
+    if ($LASTEXITCODE) { throw "minhook compile failed: $c" }
+    $mhObjs += $o
+}
+& "$bin\ar.exe" rcs build\libminhook.a @mhObjs
+if ($LASTEXITCODE) { throw 'minhook archive failed' }
+
+& "$bin\g++.exe" -std=c++17 -O2 -c "-I$mh\include" -Isrc\dwm -o build\dwm_dllmain.o src\dwm\dllmain.cpp
+if ($LASTEXITCODE) { throw 'dwm dll compile failed' }
+& "$bin\g++.exe" -shared -O2 -o build\fringeless_dwm.dll build\dwm_dllmain.o -Lbuild -lminhook `
+    -static -static-libgcc -static-libstdc++ `
+    -ld3d11 -ld3dcompiler -ldxgi -ldxguid -lpsapi -lgdi32 -luuid -lole32
+if ($LASTEXITCODE) { throw 'dwm dll link failed' }
+
+& "$bin\gcc.exe" -O2 -municode -o build\fringeless_inject.exe src\dwm\injector.c -ladvapi32
+if ($LASTEXITCODE) { throw 'injector build failed' }
+
+& "$bin\strip.exe" build\fringeless_dwm.dll build\fringeless_inject.exe
+
+Get-Item build\Fringeless.exe, build\fringeless_dwm.dll, build\fringeless_inject.exe |
+    Select-Object Name, Length

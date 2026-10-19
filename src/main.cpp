@@ -1,7 +1,7 @@
 // Fringeless - subpixel colour-fringe correction for QD-OLED displays.
 //
 // Startup, the on/off shortcut and the tray icon. The control panel lives in panel.cpp,
-// the capture and correction pipeline in renderer.cpp.
+// the DWM correction engine in src/dwm_engine.cpp.
 
 #include "app.h"
 #include "resource.h"
@@ -14,12 +14,16 @@
 HWND g_panel;
 static NOTIFYICONDATAW g_tray;
 
+// Published runtime state (was the render thread's; now mostly reflects the on/off state).
+Runtime g_runtime;
+
 enum { HK_TOGGLE = 1 };
 enum { IDM_OPEN = 100, IDM_TOGGLE, IDM_QUIT };
 
 void SettingsChanged() {
     SaveSettings();
     g_runtime.redrawAll = true;
+    DwmEngineSync();   // inject on an off->on edge, then publish the new parameters live
     UpdateTray();
 }
 
@@ -209,17 +213,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int showCmd) {
     RefreshPanel();
     AddTrayIcon(inst);
 
-    HANDLE render = CreateThread(nullptr, 0, RenderThread, nullptr, 0, nullptr);
+    // Correction runs inside dwm.exe via the DWM engine. Bring it up now if correction is
+    // already enabled (prompts for UAC once); later toggles go through SettingsChanged.
+    DwmEngineSync();
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
     g_runtime.running = false;
-    if (render) {
-        WaitForSingleObject(render, 3000);
-        CloseHandle(render);
-    }
+    DwmEngineShutdown();   // leave the engine loaded in dwm; just release our handles
     Shell_NotifyIconW(NIM_DELETE, &g_tray);
     SaveSettings();
     ReleaseDisplays();
