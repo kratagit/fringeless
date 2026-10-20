@@ -404,6 +404,11 @@ struct FringeParams {
     float        sx[3];   // per-channel X shift in pixels (R, G, B)
     float        sy[3];   // per-channel Y shift in pixels
     int          bicubic; // reserved; bilinear sampling for now
+    int          matchMonitor; // 1 = correct only the target monitor; 0 = all SDR
+    int          left;    // target monitor's top-left in desktop coordinates (diagnostic)
+    int          top;
+    int          width;   // target monitor's composed resolution: the reliable identifier
+    int          height;
 };
 #pragma pack(pop)
 static const unsigned int kParamsMagic = 0x46524E47; // 'FRNG'
@@ -962,6 +967,9 @@ void UninitializeStuff()
 }
 
 // Shared rendering core. Does NOT release backBuffer - caller handles it.
+// The overlay context's monitor position in desktop coordinates (same layout dwm_lut
+// reads to match a LUT to a monitor). Returns false if it cannot be read, in which case
+// the caller corrects the context rather than risk leaving a monitor uncorrected.
 bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagRECT* rects, int numRects)
 {
 	ID3D11RenderTargetView* renderTargetView;
@@ -1002,6 +1010,19 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	if (g_params && g_params->magic == kParamsMagic && !g_params->enabled)
 	{
 		return false;
+	}
+
+	// Correct only the selected monitor, identified by its composed resolution. (The
+	// per-context position field moved between DWM servicing builds, so it is unreliable;
+	// resolution is stable.) Dimensions are compared unordered so a rotated monitor, whose
+	// composed surface is landscape, still matches the display the app reports.
+	if (g_params && g_params->magic == kParamsMagic && g_params->matchMonitor &&
+	    g_params->width > 0 && g_params->height > 0)
+	{
+		int bw = (int)newBackBufferDesc.Width, bh = (int)newBackBufferDesc.Height;
+		bool match = (bw == g_params->width && bh == g_params->height) ||
+		             (bw == g_params->height && bh == g_params->width);
+		if (!match) return false;
 	}
 
 	D3D11_TEXTURE2D_DESC oldTextureDesc = textureDesc[index];

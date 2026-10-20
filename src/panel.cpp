@@ -203,7 +203,7 @@ enum Id {
     kNone, kDisplay, kEnabled,
     kShift0, kShift5 = kShift0 + 5,
     kReset, kBilinear, kBicubic, kPause, kQuit,
-    kSettings, kBack, kRecord, kStartup, kOpenFolder,
+    kSettings, kBack, kRecord, kStartup, kOpenFolder, kTestPattern, kEngine,
     kValue0 = 100,   // + slider index: the value text, click to type a value
 };
 
@@ -496,7 +496,15 @@ float MainLeft(float x, float y, float w, float stretch) {
                      L"Games and video players pause correction; browsers, editors and terminals in full screen "
                      L"keep it.",
                      T.text2) + 16.0f;
+
+        bool engineLoaded = DwmEngineReady();
+        Text(engineLoaded ? L"Correction engine: loaded" : L"Correction engine: not loaded", g_fBody,
+             { cx, cy, cx + cw - 118.0f, cy + 32.0f }, T.text2);
+        Button(kEngine, { cx + cw - 108.0f, cy, cx + cw, cy + 32.0f }, engineLoaded ? L"Eject" : L"Inject");
+        cy += 44.0f;
+
         cy = AtFoot(cy, bottom, 32.0f);
+        Button(kTestPattern, { cx, cy, cx + 130.0f, cy + 32.0f }, L"Test pattern");
         Button(kQuit, { cx + cw - 130.0f, cy, cx + cw, cy + 32.0f }, L"Quit " APP_NAME);
         return cy + 32.0f;
     }, stretch);
@@ -959,6 +967,14 @@ void Activate(HWND hwnd, const Hit& h) {
             return;
         case kOpenFolder:
             ShellExecuteW(hwnd, L"open", SettingsFolder().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            return;
+        case kTestPattern:
+            OpenTestPattern();
+            return;
+        case kEngine:
+            if (DwmEngineReady()) DwmEngineStop(); else DwmEngineInject();
+            UpdateTray();
+            RefreshPanel();
             return;
         default: return;
     }
