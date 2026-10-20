@@ -17,6 +17,11 @@ struct FringeParams {
     float        sx[3];
     float        sy[3];
     int          bicubic;
+    int          matchMonitor;  // 1 = correct only the target monitor
+    int          left;
+    int          top;
+    int          width;         // target monitor resolution: the reliable identifier
+    int          height;
 };
 #pragma pack(pop)
 static const unsigned int kFringeMagic = 0x46524E47u; // 'FRNG'
@@ -25,14 +30,6 @@ static volatile FringeParams* g_params = nullptr;
 static HANDLE g_file = nullptr;
 static HANDLE g_map  = nullptr;
 
-static std::wstring ExeDir() {
-    wchar_t buf[MAX_PATH];
-    GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    std::wstring s(buf);
-    size_t p = s.rfind(L'\\');
-    return p == std::wstring::npos ? L"" : s.substr(0, p + 1);
-}
-
 // True if the engine DLL is already loaded in dwm (marker published by the DLL).
 static bool EngineLoaded() {
     HANDLE m = OpenMutexW(SYNCHRONIZE, FALSE, L"Global\\FringelessDwmEngine");
@@ -40,15 +37,16 @@ static bool EngineLoaded() {
     return false;
 }
 
-// Run the bundled injector elevated and wait for it. Returns false if the user declined
-// the UAC prompt or the helper could not be launched.
-static bool RunInjector(const std::wstring& args) {
+// Re-launch this same executable elevated with a verb (--inject / --eject) and wait for it.
+// Returns false if the user declined the UAC prompt or the launch failed.
+static bool RunSelfElevated(const wchar_t* args) {
+    wchar_t self[MAX_PATH];
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
     SHELLEXECUTEINFOW sei = { sizeof(sei) };
     sei.fMask = SEE_MASK_NOCLOSEPROCESS;
     sei.lpVerb = L"runas";
-    std::wstring exe = ExeDir() + L"fringeless_inject.exe";
-    sei.lpFile = exe.c_str();
-    sei.lpParameters = args.c_str();
+    sei.lpFile = self;
+    sei.lpParameters = args;
     sei.nShow = SW_HIDE;
     if (!ShellExecuteExW(&sei)) return false;
     if (sei.hProcess) {
@@ -78,6 +76,15 @@ static void DwmEnginePush() {
         g_params->sy[ch] = g_settings.shift[ch][kY].load();
     }
     g_params->bicubic = g_settings.bicubic ? 1 : 0;
+    // Correct only the chosen display, so a second monitor is left untouched.
+    g_params->matchMonitor = 1;
+    if (TargetValid()) {
+        const RECT& r = g_displays[g_target.load()].rect;
+        g_params->left   = r.left;
+        g_params->top    = r.top;
+        g_params->width  = r.right - r.left;
+        g_params->height = r.bottom - r.top;
+    }
     g_params->enabled = g_settings.enabled ? 1 : 0;
     g_params->magic = kFringeMagic;
 }
@@ -87,14 +94,16 @@ static void DwmEnginePush() {
 // or failed. Safe to call repeatedly.
 static bool DwmEngineStart() {
     if (!EngineLoaded()) {
-        std::wstring dll = ExeDir() + L"fringeless_dwm.dll";
-        if (!RunInjector(L"inject \"" + dll + L"\"")) return false;
+        if (!RunSelfElevated(L"--inject")) return false;
     }
     MapParams();
     if (!g_params) return false;
     DwmEnginePush();
     return true;
 }
+
+// Explicitly load the engine now (menu "Inject"). Prompts for UAC if it is not loaded.
+void DwmEngineInject() { DwmEngineStart(); }
 
 // Reconcile the engine with the current settings. Call after any settings change and at
 // startup. Injects only on an off->on transition (one UAC prompt), never while merely
@@ -121,7 +130,7 @@ void DwmEngineShutdown() {
 // Fully unload the engine from dwm (one UAC prompt), e.g. for an explicit "unload".
 void DwmEngineStop() {
     DwmEngineShutdown();
-    if (EngineLoaded()) RunInjector(L"eject fringeless_dwm.dll");
+    if (EngineLoaded()) RunSelfElevated(L"--eject");
 }
 
 bool DwmEngineReady() { return g_params != nullptr; }

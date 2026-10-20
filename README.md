@@ -34,24 +34,26 @@ colour LUT with the per-channel sub-pixel shift and feeds the shift from live se
 
 ## Using it
 
-Run `Fringeless.exe`. The main window has:
+Fringeless is a single `Fringeless.exe` — no installer and no extra files. Run it and:
 
+- **Turn correction on** from the main switch, the tray icon or the global shortcut
+  (Win+Shift+F by default). The correction runs inside `dwm.exe`, which needs administrator
+  rights, so the **first time you turn it on after signing in Windows shows one UAC prompt**.
+  After that, toggling it and moving the sliders take effect immediately, and closing the
+  window leaves the correction running in the tray.
+- **Pick the display** to correct with the monitor selector; only that monitor is touched, so
+  a second screen that does not need the shift is left alone.
 - **Channel shift**: per-channel X/Y offsets in pixels, tuned while looking at text. Drag a
-  slider (hold Shift for fine control), scroll on it or use the arrow keys for 0.001 px steps,
-  click a value to type it, or double-click a slider to reset it.
-- **Display / behaviour** and the main on/off switch, also reachable from the tray icon and
-  the global shortcut (Win+Shift+F by default; change it in **Settings**).
+  slider (hold Shift for fine control), scroll or use the arrow keys for 0.001 px steps, click
+  a value to type it, or double-click a slider to reset it.
+- **Test pattern** (button on the main view, or the tray menu): real GDI/ClearType text in
+  many fonts and sizes with its own Correction switch, for judging the fringe on and off.
 
 Settings are stored in `%APPDATA%\Fringeless\settings.ini`.
 
-The correction runs inside `dwm.exe`, which requires administrator rights to inject into, so
-the **first time you enable correction after signing in Windows asks for confirmation (UAC)
-once**. After that the engine stays loaded: toggling correction and moving the sliders take
-effect immediately without another prompt, and closing the app leaves the correction running.
-
 Requirements: Windows 11 24H2 (build 26100) or 25H2 (build 26200) — the engine matches those
-DWM versions and simply does nothing on others; a Direct3D 11 GPU; an SDR desktop (turn HDR
-off for the corrected display).
+DWM versions and does nothing on others; a Direct3D 11 GPU; an SDR desktop (turn HDR off for
+the corrected display).
 
 ## Building
 
@@ -61,17 +63,13 @@ Requires MinGW-w64, e.g. `winget install BrechtSanders.WinLibs.POSIX.UCRT`.
 .\build.ps1
 ```
 
-Produces three files in `build\`, statically linked:
-
-| File                     | What it is                                                     |
-| ------------------------ | -------------------------------------------------------------- |
-| `Fringeless.exe`         | The app: UI, tray, settings, and engine control                |
-| `fringeless_dwm.dll`     | The correction engine, injected into `dwm.exe`                 |
-| `fringeless_inject.exe`  | Elevated helper that injects/ejects the engine                 |
+Produces a single `build\Fringeless.exe`, statically linked. The DWM engine is built first as
+a DLL and embedded in the executable as a resource; at runtime the app extracts it to a
+temporary folder and injects it, re-launching itself elevated, when correction is turned on.
 
 Every push is built by GitHub Actions
-([`.github/workflows/build.yml`](.github/workflows/build.yml)); the three files are attached
-to the run, and pushing a `v*` tag publishes them as a release.
+([`.github/workflows/build.yml`](.github/workflows/build.yml)); `Fringeless.exe` is attached to
+the run, and pushing a `v*` tag publishes it as a release.
 
 ## Layout
 
@@ -79,10 +77,12 @@ to the run, and pushing a `v*` tag publishes them as a release.
 | ------------------------- | ------------------------------------------------------------ |
 | `src/main.cpp`            | Startup, tray icon, the on/off shortcut                      |
 | `src/panel.cpp`           | The window (Direct2D/DirectWrite, light/dark, Mica)          |
-| `src/dwm_engine.cpp`      | Injects/controls the engine and publishes live parameters    |
+| `src/dwm_engine.cpp`      | Controls the engine and publishes live parameters            |
+| `src/inject.cpp`          | The elevated `--inject`/`--eject` mode built into the exe     |
+| `src/testpattern.cpp`     | The built-in test pattern window                             |
 | `src/settings.cpp`        | Settings file and start with Windows                         |
 | `src/displays.cpp`        | Display enumeration and names                                 |
-| `src/dwm/`                | The engine DLL and injector (GPL-3.0; derived from dwm_lut)   |
+| `src/dwm/`                | The engine DLL embedded in the exe (GPL-3.0; from dwm_lut)    |
 | `third_party/minhook/`    | MinHook, the function-hooking library (BSD-2-Clause)          |
 
 ## Credits and licence

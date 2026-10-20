@@ -102,9 +102,18 @@ std::wstring ProcessNameOf(HWND hwnd);
 // DWM correction engine (src/dwm_engine.cpp). The correction runs inside dwm.exe; the app
 // injects the engine (one UAC prompt) when correction is first enabled and drives it live.
 void DwmEngineSync();       // after a settings change / at startup: inject on off->on, push params
-void DwmEngineShutdown();   // release handles on exit; leaves the engine loaded in dwm
+void DwmEngineInject();     // explicitly load the engine now (menu "Inject"; one UAC prompt)
+void DwmEngineShutdown();   // release handles on exit without unloading the engine
 void DwmEngineStop();       // fully unload the engine from dwm (one UAC prompt)
 bool DwmEngineReady();      // true once the engine's parameter block is mapped
+
+// Test pattern window (src/testpattern.cpp): real GDI/ClearType text in many fonts and
+// sizes with a live magnifier, for judging the colour fringe.
+void OpenTestPattern();
+
+// Elevated injector mode (src/inject.cpp). Returns an exit code for an --inject/--eject
+// launch, or -1 for a normal launch (then the app starts its UI).
+int InjectModeMain(const wchar_t* cmdLine);
 
 enum : UINT {
     WM_APP_TRAY = WM_APP + 1,      // tray icon callback

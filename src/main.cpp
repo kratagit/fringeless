@@ -18,7 +18,7 @@ static NOTIFYICONDATAW g_tray;
 Runtime g_runtime;
 
 enum { HK_TOGGLE = 1 };
-enum { IDM_OPEN = 100, IDM_TOGGLE, IDM_QUIT };
+enum { IDM_OPEN = 100, IDM_TOGGLE, IDM_TEST, IDM_INJECT, IDM_EJECT, IDM_QUIT };
 
 void SettingsChanged() {
     SaveSettings();
@@ -43,6 +43,12 @@ void ShowTrayMenu(HWND owner) {
     std::wstring toggle = L"Correction" + (g_hotkeyName.empty() ? L"" : L"\t" + g_hotkeyName);
     AppendMenuW(menu, MF_STRING | (g_settings.enabled ? MF_CHECKED : 0), IDM_TOGGLE, toggle.c_str());
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, IDM_TEST, L"Test pattern");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    bool loaded = DwmEngineReady();
+    AppendMenuW(menu, MF_STRING | (loaded ? MF_GRAYED : 0), IDM_INJECT, L"Inject engine");
+    AppendMenuW(menu, MF_STRING | (loaded ? 0 : MF_GRAYED), IDM_EJECT, L"Eject engine");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_QUIT, L"Quit");
     SetMenuDefaultItem(menu, IDM_OPEN, FALSE);
     POINT pt;
@@ -57,6 +63,9 @@ void ShowTrayMenu(HWND owner) {
             SettingsChanged();
             RefreshPanel();
             break;
+        case IDM_TEST: OpenTestPattern(); break;
+        case IDM_INJECT: DwmEngineInject(); UpdateTray(); RefreshPanel(); break;
+        case IDM_EJECT: DwmEngineStop(); UpdateTray(); RefreshPanel(); break;
         case IDM_QUIT: DestroyWindow(owner); break;
     }
 }
@@ -178,6 +187,10 @@ static void AddTrayIcon(HINSTANCE inst) {
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int showCmd) {
+    // Launched elevated to inject/eject the engine into dwm.exe: do that and exit.
+    int injMode = InjectModeMain(cmdLine);
+    if (injMode >= 0) return injMode;
+
     // One instance: a second start just brings the running one forward.
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\Fringeless.SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -222,7 +235,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdLine, int showCmd) {
         DispatchMessageW(&msg);
     }
     g_runtime.running = false;
-    DwmEngineShutdown();   // leave the engine loaded in dwm; just release our handles
+    DwmEngineStop();   // fully unload the engine from dwm when the app closes
     Shell_NotifyIconW(NIM_DELETE, &g_tray);
     SaveSettings();
     ReleaseDisplays();
